@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PyTorch / model files
+*.pt
+*.pth
+*.ckpt
+
+# Outputs
+outputs/
+*.pdf
+
+# Logs
+*.log
+
+# Colab
+*.ipynb_checkpoints
