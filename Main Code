@@ -1,0 +1,212 @@
+# ======================================================================
+# 🔬 UNIVERSAL PROTEIN FUNCTION CLASSIFIER (with ensemble classifiers)
+# ======================================================================
+# Fetches real UniProt-reviewed sequences, embeds them with pretrained
+# ESM2 (Hugging Face), trains multiple classifiers, predicts the function
+# of input protein sequences + export report PDF.
+# ======================================================================
+
+!pip install transformers torch biopython reportlab tqdm scikit-learn ipywidgets -q
+
+import os, re, random, torch, requests, numpy as np, pandas as pd
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from requests.adapters import HTTPAdapter, Retry
+from IPython.display import display
+import ipywidgets as widgets
+
+# ----------------------------------------------------------------------
+# STEP 1: FETCH REAL SEQUENCES FROM UNIPROT
+# ----------------------------------------------------------------------
+categories = {
+    "enzyme": "(enzyme) AND (reviewed:true) AND (organism_id:9606)",
+    "transport": "(transporter) AND (reviewed:true) AND (organism_id:9606)",
+    "signal": "(signal) AND (reviewed:true) AND (organism_id:9606)",
+    "structural": "(structural) AND (reviewed:true) AND (organism_id:9606)",
+    "immune": "(immune) AND (reviewed:true) AND (organism_id:9606)"
+}
+
+def fetch_uniprot(category, query, batch_size=200, limit=1000):
+    base = "https://rest.uniprot.org/uniprotkb/search?"
+    url = f"{base}query={query.replace(' ', '%20')}&format=fasta&size={batch_size}"
+    re_next = re.compile(r'<(.+)>; rel="next"')
+    retries = Retry(total=5, backoff_factor=0.3, status_forcelist=[429,500,502,503,504])
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    seqs, seen = [], set()
+    while url and len(seqs) < limit:
+        r = session.get(url)
+        if r.status_code != 200: break
+        lines = r.text.strip().split("\n")
+        for i, line in enumerate(lines):
+            if line.startswith(">"):
+                if line not in seen and not any(x in line for x in ["UNCHARACTERIZED","PREDICTED","DUMMY"]):
+                    seen.add(line)
+                    if i+1 < len(lines) and not lines[i+1].startswith(">"):
+                        seqs.append(lines[i+1])
+        match = re_next.match(r.headers.get("Link", ""))
+        url = match.group(1) if match else None
+    print(f"✅ {category.capitalize()}: {len(seqs)} sequences")
+    return seqs[:limit]
+
+dataset = []
+for cat, q in categories.items():
+    seqs = fetch_uniprot(cat, q, limit=1000)
+    dataset += [(s, cat) for s in seqs]
+
+# Add “other/unknown” fallback samples
+other = [''.join(random.choices('ACDEFGHIKLMNPQRSTVWY', k=random.randint(50,300))) for _ in range(1000)]
+dataset += [(s, "other") for s in other]
+random.shuffle(dataset)
+print(f"\n🎯 Completed! Total sequences: {len(dataset)}")
+
+# ----------------------------------------------------------------------
+# STEP 2: LOAD PRETRAINED ESM2 MODEL
+# ----------------------------------------------------------------------
+print("\n📦 Loading pretrained ESM2 model...")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
+model = AutoModel.from_pretrained("facebook/esm2_t6_8M_UR50D").to(device)
+model.eval()
+print("✅ Model ready for embedding.")
+
+# ----------------------------------------------------------------------
+# STEP 3: EMBEDDING + CLASSIFIERS
+# ----------------------------------------------------------------------
+def get_embedding(seq):
+    with torch.no_grad():
+        inputs = tokenizer(seq, return_tensors='pt', truncation=True, max_length=512).to(device)
+        outputs = model(**inputs)
+        return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+
+# Generate embeddings
+print("\n🚀 Generating embeddings (may take a while)...")
+X, y = [], []
+le = LabelEncoder()
+labels = le.fit_transform([l for _,l in dataset])
+for seq, label in tqdm(dataset):
+    X.append(get_embedding(seq))
+    y.append(label)
+X = np.array(X)
+y = np.array(labels)
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# MLP Classifier
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim, n_classes):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, n_classes)
+        )
+    def forward(self, x):
+        return self.fc(x)
+
+mlp = MLPClassifier(X.shape[1], len(le.classes_)).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-4)
+
+# Train MLP (few epochs for demo)
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+y_train_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
+print("\n🚀 Training MLP...")
+for epoch in range(5):
+    mlp.train()
+    optimizer.zero_grad()
+    preds = mlp(X_train_tensor)
+    loss = criterion(preds, y_train_tensor)
+    loss.backward()
+    optimizer.step()
+    print(f"Epoch {epoch+1}: loss = {loss.item():.4f}")
+mlp.eval()
+
+# Logistic Regression
+lr = LogisticRegression(max_iter=500)
+lr.fit(X_train, y_train)
+
+# Random Forest
+rf = RandomForestClassifier(n_estimators=100)
+rf.fit(X_train, y_train)
+
+# ----------------------------------------------------------------------
+# STEP 4: PREDICT + GENERATE REPORT
+# ----------------------------------------------------------------------
+seq_box = widgets.Textarea(
+    placeholder='Paste your protein sequence here...',
+    description='Sequence:',
+    layout=widgets.Layout(width='100%', height='150px')
+)
+button = widgets.Button(description='🔍 Predict Function', button_style='success')
+output = widgets.Output()
+display(seq_box, button, output)
+
+def create_pdf_report(sequence, predictions, confidences, similar_classes):
+    file = "protein_prediction_report.pdf"
+    c = canvas.Canvas(file, pagesize=letter)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, 750, "Protein Function Prediction Report")
+    c.setFont("Helvetica", 12)
+    c.drawString(50, 720, f"🧬 Input Sequence (first 60 aa): {sequence[:60]}...")
+    for clf_name, pred, conf, sim in zip(predictions.keys(), predictions.values(), confidences.values(), similar_classes.values()):
+        c.drawString(50, 700 - 20*list(predictions.keys()).index(clf_name),
+                     f"{clf_name}: Predicted={pred}, Confidence={conf*100:.2f}%, 2nd={sim}")
+    c.drawString(50, 640, f"📅 Timestamp: {pd.Timestamp.now()}")
+    c.save()
+    print(f"📄 Report saved as {file}")
+
+def on_click(b):
+    with output:
+        output.clear_output()
+        seq = seq_box.value.strip()
+        if not seq:
+            print("❌ Please paste a protein sequence first.")
+            return
+        emb = get_embedding(seq)
+        emb_tensor = torch.tensor(emb, dtype=torch.float32).to(device)
+
+        # MLP
+        with torch.no_grad():
+            logits = mlp(emb_tensor.unsqueeze(0))
+            probs_mlp = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            pred_idx = np.argmax(probs_mlp)
+            pred_class_mlp = le.inverse_transform([pred_idx])[0]
+            conf_mlp = probs_mlp[pred_idx]
+            sim_mlp = le.inverse_transform([np.argsort(probs_mlp)[-2]])[0]
+
+        # Logistic Regression
+        probs_lr = lr.predict_proba([emb])[0]
+        pred_idx_lr = np.argmax(probs_lr)
+        pred_class_lr = le.inverse_transform([pred_idx_lr])[0]
+        conf_lr = probs_lr[pred_idx_lr]
+        sim_lr = le.inverse_transform([np.argsort(probs_lr)[-2]])[0]
+
+        # Random Forest
+        probs_rf = rf.predict_proba([emb])[0]
+        pred_idx_rf = np.argmax(probs_rf)
+        pred_class_rf = le.inverse_transform([pred_idx_rf])[0]
+        conf_rf = probs_rf[pred_idx_rf]
+        sim_rf = le.inverse_transform([np.argsort(probs_rf)[-2]])[0]
+
+        predictions = {"MLP": pred_class_mlp, "LogReg": pred_class_lr, "RandomForest": pred_class_rf}
+        confidences = {"MLP": conf_mlp, "LogReg": conf_lr, "RandomForest": conf_rf}
+        similar_classes = {"MLP": sim_mlp, "LogReg": sim_lr, "RandomForest": sim_rf}
+
+        print(f"🧩 Predictions: {predictions}")
+        print(f"📊 Confidences: {confidences}")
+        print(f"🔗 2nd-best classes: {similar_classes}")
+
+        create_pdf_report(seq, predictions, confidences, similar_classes)
+
+button.on_click(on_click)
